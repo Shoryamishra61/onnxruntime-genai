@@ -10,6 +10,25 @@ namespace Generators {
 
 inline constexpr uint32_t kQwen38PlaneVersion = 1;
 
+// Descriptor for replaying compact state updates (state_update_capacity = K) across the 2-bank ping-pong ring.
+struct Qwen38StateReplayDesc {
+  int kind;
+  int channels;
+  int state_length;
+  int capture_cap;
+  int state_capacity;
+  int pad_;
+  uint8_t* bank_ptrs[2];
+  uint8_t* bank_len_ptrs[2];
+  const uint8_t* state_update_ptr;
+  uint8_t* shared_index_key_ptr;
+  const uint8_t* knorm_ptr;
+  const uint8_t* cos_ptr;
+  const uint8_t* sin_ptr;
+  int rope_width;
+  float eps;
+};
+
 // No CUDA types cross the core/add-on boundary. Streams and device buffers are opaque.
 struct Qwen38PlaneFunctions {
   int (*sizeof_params)(){};
@@ -44,6 +63,7 @@ struct Qwen38PlaneFunctions {
   void (*embed_rows)(void*, const void*, const void*, void*, int, int, int){};
   int (*dflash_select)(void*, const void*, const void*, void*, int, int){};
   int (*argmax_finish)(void*, const void*, const void*, int, void*){};
+  void (*replay_state_updates)(void*, const void*, int, int, int, int){};
 };
 
 using GetQwen38PlaneFunctionsFn = const Qwen38PlaneFunctions* (*)(uint32_t, size_t);

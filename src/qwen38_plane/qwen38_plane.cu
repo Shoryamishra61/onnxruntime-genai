@@ -514,7 +514,7 @@ int qg_mem_info(size_t* free_bytes, size_t* total_bytes) { return (int)cudaMemGe
 
 __global__ void DflashSelect(const int32_t* candidates, const float* scores, i64* control,
                             int drafts, int top_k) {
-  const int slots[] = {2, 8, 9};
+  const int slots[] = {2, 8, 9, 10, 11, 12, 13};
   int previous = 0;
   for (int step = 0; step < drafts; ++step) {
     const float* row = scores + (step * top_k + previous) * top_k;
@@ -529,7 +529,7 @@ __global__ void DflashSelect(const int32_t* candidates, const float* scores, i64
 
 extern "C" int qg_dflash_select(void* stream, const void* candidates, const void* scores,
                                 void* control, int drafts, int top_k) {
-  if (!candidates || !scores || !control || drafts < 1 || drafts > 3 || top_k < 1)
+  if (!candidates || !scores || !control || drafts < 1 || drafts > 7 || top_k < 1)
     return static_cast<int>(cudaErrorInvalidValue);
   DflashSelect<<<1, 1, 0, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const int32_t*>(candidates), static_cast<const float*>(scores),
@@ -559,6 +559,121 @@ extern "C" int qg_argmax_finish(void* stream, const void* values, const void* in
   return static_cast<int>(cudaGetLastError());
 }
 
+namespace {
+
+__global__ void k_replay_gdn(const Generators::Qwen38StateReplayDesc* descs, int num_descs, int src_bank, int dst_bank, int step) {
+  const Generators::Qwen38StateReplayDesc& d = descs[blockIdx.y];
+  if (d.kind != 1) return;
+  const int hv = blockIdx.x;
+  if (hv >= 48) return;
+  const int lane = threadIdx.x;
+  const int warp = threadIdx.y;
+  const int cap = d.capture_cap;
+  const int head_stride = cap + cap * 128 + cap * 128;
+  const float* cap_base = reinterpret_cast<const float*>(d.state_update_ptr) + static_cast<size_t>(hv) * head_stride;
+  const float* src_head = reinterpret_cast<const float*>(d.bank_ptrs[src_bank]) + static_cast<size_t>(hv) * 128 * 128;
+  float* dst_head = reinterpret_cast<float*>(d.bank_ptrs[dst_bank]) + static_cast<size_t>(hv) * 128 * 128;
+
+  for (int col_base = 0; col_base < 128; col_base += 4) {
+    const int col = col_base + warp;
+    float s0 = src_head[col * 128 + lane];
+    float s1 = src_head[col * 128 + lane + 32];
+    float s2 = src_head[col * 128 + lane + 64];
+    float s3 = src_head[col * 128 + lane + 96];
+    for (int t = 0; t < step; ++t) {
+      const float decay = cap_base[t];
+      const float k0 = cap_base[cap + t * 128 + lane];
+      const float k1 = cap_base[cap + t * 128 + lane + 32];
+      const float k2 = cap_base[cap + t * 128 + lane + 64];
+      const float k3 = cap_base[cap + t * 128 + lane + 96];
+      const float v_col = cap_base[cap + cap * 128 + t * 128 + col];
+      s0 *= decay;
+      s1 *= decay;
+      s2 *= decay;
+      s3 *= decay;
+      float kv = s0 * k0 + s1 * k1 + s2 * k2 + s3 * k3;
+#pragma unroll
+      for (int offset = 16; offset > 0; offset >>= 1) {
+        kv += __shfl_xor_sync(0xffffffffu, kv, offset);
+      }
+      const float delta = v_col - kv;
+      s0 = fmaf(k0, delta, s0);
+      s1 = fmaf(k1, delta, s1);
+      s2 = fmaf(k2, delta, s2);
+      s3 = fmaf(k3, delta, s3);
+    }
+    dst_head[col * 128 + lane] = s0;
+    dst_head[col * 128 + lane + 32] = s1;
+    dst_head[col * 128 + lane + 64] = s2;
+    dst_head[col * 128 + lane + 96] = s3;
+  }
+}
+
+__global__ void k_replay_generic(const Generators::Qwen38StateReplayDesc* descs, int num_descs, int src_bank, int dst_bank, int step) {
+  const Generators::Qwen38StateReplayDesc& d = descs[blockIdx.y];
+  if (d.kind == 2 || d.kind == 3) {
+    const int C = d.channels;
+    const int L = d.state_length;
+    const __nv_bfloat16* past = reinterpret_cast<const __nv_bfloat16*>(d.bank_ptrs[src_bank]);
+    __nv_bfloat16* pres = reinterpret_cast<__nv_bfloat16*>(d.bank_ptrs[dst_bank]);
+    const __nv_bfloat16* upd = reinterpret_cast<const __nv_bfloat16*>(d.state_update_ptr);
+    for (int c = blockIdx.x * blockDim.x + threadIdx.x; c < C; c += gridDim.x * blockDim.x) {
+      for (int pos = 0; pos < L; ++pos) {
+        const int src = step - L + pos;
+        __nv_bfloat16 val;
+        if (src >= 0) {
+          val = upd[src * C + c];
+        } else {
+          val = (d.kind == 2) ? past[c * L + (L + src)] : past[(L + src) * C + c];
+        }
+        if (d.kind == 2) {
+          pres[c * L + pos] = val;
+        } else {
+          pres[pos * C + c] = val;
+        }
+      }
+    }
+  } else if (d.kind == 4) {
+    if (blockIdx.x != 0) return;
+    const int32_t* past_len = reinterpret_cast<const int32_t*>(d.bank_len_ptrs[src_bank]);
+    int32_t* pres_len = reinterpret_cast<int32_t*>(d.bank_len_ptrs[dst_bank]);
+    const int old_key_len = past_len[0];
+    const int old_buf_len = past_len[1];
+    if (old_key_len < 0 || old_buf_len < 0 || old_buf_len >= 4) return;
+    const int total = old_buf_len + step;
+    const int new_blocks = total / 4;
+    const int new_buf_len = total % 4;
+    if (threadIdx.x == 0) {
+      pres_len[0] = old_key_len + new_blocks;
+      pres_len[1] = new_buf_len;
+    }
+    const __nv_bfloat16* past_buf = reinterpret_cast<const __nv_bfloat16*>(d.bank_ptrs[src_bank]);
+    __nv_bfloat16* pres_buf = reinterpret_cast<__nv_bfloat16*>(d.bank_ptrs[dst_bank]);
+    const __nv_bfloat16* upd = reinterpret_cast<const __nv_bfloat16*>(d.state_update_ptr);
+    const int rem_start = new_blocks * 4;
+    for (int r = 0; r < new_buf_len; ++r) {
+      const int idx = rem_start + r;
+      const __nv_bfloat16* src_row = (idx < old_buf_len) ? (past_buf + idx * 128) : (upd + (idx - old_buf_len) * 128);
+      for (int c = threadIdx.x; c < 128; c += blockDim.x) {
+        pres_buf[r * 128 + c] = src_row[c];
+      }
+    }
+  }
+}
+
+}  // namespace
+
+extern "C" void qg_replay_state_updates(void* stream, const void* descs, int num_descs, int src_bank, int dst_bank, int step) {
+  if (!descs || num_descs <= 0 || step <= 0) return;
+  cudaStream_t s = static_cast<cudaStream_t>(stream);
+  const auto* d_ptr = static_cast<const Generators::Qwen38StateReplayDesc*>(descs);
+  dim3 gdn_grid(48, num_descs);
+  dim3 gdn_block(32, 4);
+  k_replay_gdn<<<gdn_grid, gdn_block, 0, s>>>(d_ptr, num_descs, src_bank, dst_bank, step);
+  dim3 gen_grid(80, num_descs);
+  k_replay_generic<<<gen_grid, 128, 0, s>>>(d_ptr, num_descs, src_bank, dst_bank, step);
+}
+
 extern "C" __attribute__((visibility("default")))
 const Generators::Qwen38PlaneFunctions* GetQwen38PlaneFunctions(uint32_t version, size_t size) {
   using Generators::Qwen38PlaneFunctions;
@@ -579,6 +694,7 @@ const Generators::Qwen38PlaneFunctions* GetQwen38PlaneFunctions(uint32_t version
     f.stream_destroy = qg_stream_destroy;
     f.dflash_select = qg_dflash_select;
     f.argmax_finish = qg_argmax_finish;
+    f.replay_state_updates = qg_replay_state_updates;
     f.memset_ = [](void* p, int value, size_t bytes, void* stream) {
       return qg_memset(p, value, bytes, static_cast<cudaStream_t>(stream));
     };

@@ -195,6 +195,7 @@ struct Qwen38GraphEngine {
   void Drain();  // wait for all enqueued work
   bool CycleInFlight() const { return inflight_; }
   int Capacity() const { return capacity_; }
+  int ReservedTail() const { return std::max(verify_rows_, Qwen38DecodeDevice::kReservedTail); }
   const Qwen38GraphStats& Stats() const { return stats_; }
 
   double warmup_seconds{};
@@ -264,6 +265,7 @@ struct Qwen38GraphEngine {
   void Draft(const uint8_t* features, size_t rows, size_t position, int32_t anchor, bool propose);
 
   void PrepRow(int rows, int row, const void* tok, const void* pos, int add, const void* ctx_in, void* ctx_out);
+  void ReplayStateUpdates(int src_bank, int dst_bank, int step);
   void RunTarget(int rows, int phase);
   void EnqueueVerify();
   void EnqueueStep();
@@ -301,10 +303,16 @@ struct Qwen38GraphEngine {
   bool suffix_lookup_hit_{};
   size_t suffix_lookup_tokens_proposed_{};
   static constexpr int kBanks = 3;
-  static constexpr int kMaxVerifyRows = 4;
+  static constexpr int kMaxVerifyRows = 8;
   static constexpr int kMaxBanks = kMaxVerifyRows + 1;
   int verify_rows_{2};
   int num_banks_{kBanks};
+  bool compact_state_updates_{false};
+  int num_replay_descs_{0};
+  std::map<std::string, std::unique_ptr<DevTensor>> state_updates_;
+  PlaneBuffer replay_descs_dev_;
+  PlaneBuffer capture_count_dev_;
+  std::unique_ptr<DevTensor> capture_count_tensor_;
   static constexpr int kRing = 64;
   static constexpr int kArgmaxBlocks = 16;
 

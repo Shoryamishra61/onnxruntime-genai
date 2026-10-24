@@ -566,7 +566,9 @@ void Qwen38GraphEngine::FastUnifiedAppend(std::span<const int32_t> tokens) {
       // its head hidden bridge; padding logits_indices would read beyond an S=1 tail.
       const size_t logit_rows = std::min(m, static_cast<size_t>(verify_rows_));
       for (const auto& name : f.dense_inputs) {
-        if (name == "prefill_numerics")
+        if (name == "state_update_capture_count")
+          binding->BindInput(name.c_str(), *capture_count_tensor_->value);
+        else if (name == "prefill_numerics")
           binding->BindInput(name.c_str(), PrefillNumerics(true));
         else if (name.rfind("prefill_cache.", 0) == 0)
           binding->BindInput(name.c_str(), NumericalCache(name, f.dense_info, true));
@@ -640,7 +642,9 @@ void Qwen38GraphEngine::FastUnifiedAppend(std::span<const int32_t> tokens) {
           }
           binding->BindOutput(name.c_str(), head_store_.count(state) ? *head_store_.at(state)->value
                                                                      : *head_banks_[bank].tensors.at(state)->value);
-        } else
+        } else if (state_updates_.count(name))
+          binding->BindOutput(name.c_str(), *state_updates_.at(name)->value);
+        else
           binding->BindOutput(name.c_str(), *memory_info_);
       }
       f.dense->Run(f.run_options.get(), *binding);

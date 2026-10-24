@@ -37,8 +37,14 @@ class ScriptedQwen38Device final : public Qwen38DecodeDevice {
   std::vector<int> accepted_prefix_pattern;
   std::vector<bool> suffix_lookup_pattern;
   void SetDraftCount(int count) {
-    if (count < 1 || count > 3) throw std::invalid_argument("draft count must be in [1, 3]");
-    ledger_.SetNumBanks(count + 2);
+    if (count < 1 || count > 7) throw std::invalid_argument("draft count must be in [1, 7]");
+    if (count <= 3) {
+      ledger_.SetCompactMode(false);
+      ledger_.SetNumBanks(count + 2);
+    } else {
+      ledger_.SetNumBanks(2);
+      ledger_.SetCompactMode(true, count + 1);
+    }
     draft_count_ = count;
   }
   std::map<size_t, int32_t> overrides;  // position -> token (for example the EOS id)
@@ -140,8 +146,14 @@ class ScriptedQwen38Device final : public Qwen38DecodeDevice {
     record.pred1 = record.accepted ? TokenAt(length + 2) : -7;  // a rejected draft leaves row 1 meaningless
     record.pred2 = record.accepted_count >= 2 ? TokenAt(length + 3) : -7;
     record.pred3 = record.accepted_count >= 3 ? TokenAt(length + 4) : -7;
+    record.pred4 = record.accepted_count >= 4 ? TokenAt(length + 5) : -7;
+    record.pred5 = record.accepted_count >= 5 ? TokenAt(length + 6) : -7;
+    record.pred6 = record.accepted_count >= 6 ? TokenAt(length + 7) : -7;
+    record.pred7 = record.accepted_count >= 7 ? TokenAt(length + 8) : -7;
     const size_t step = record.TokenCount();
-    const std::array<int64_t, 4> predictions{record.pred0, record.pred1, record.pred2, record.pred3};
+    const std::array<int64_t, 8> predictions{
+        record.pred0, record.pred1, record.pred2, record.pred3,
+        record.pred4, record.pred5, record.pred6, record.pred7};
     record.new_pending = predictions[record.AcceptedCount()];
     record.new_length = static_cast<int64_t>(length + step);
     return record;

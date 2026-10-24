@@ -14,7 +14,7 @@
 
 namespace Generators {
 
-// One verification cycle. The target commits one token plus the matching prefix of up to three drafts.
+// One verification cycle. The target commits one token plus the matching prefix of up to seven drafts.
 struct Qwen38CycleRecord {
   int64_t pred0{};
   int64_t pred1{};
@@ -24,6 +24,10 @@ struct Qwen38CycleRecord {
   int64_t new_length{};
   int64_t pred2{};
   int64_t pred3{};
+  int64_t pred4{};
+  int64_t pred5{};
+  int64_t pred6{};
+  int64_t pred7{};
   int accepted_count{};
   int proposed_count{1};
   bool suffix_lookup_attempted{};
@@ -31,7 +35,7 @@ struct Qwen38CycleRecord {
   size_t suffix_lookup_tokens_proposed{};
 
   size_t AcceptedCount() const {
-    if (proposed_count < 1 || proposed_count > 3 || accepted_count < 0 || accepted_count > proposed_count)
+    if (proposed_count < 1 || proposed_count > 7 || accepted_count < 0 || accepted_count > proposed_count)
       throw std::logic_error("qwen38_graph: invalid draft acceptance counts");
     return accepted_count > 0 ? static_cast<size_t>(accepted_count) : (accepted ? 1 : 0);
   }
@@ -79,6 +83,7 @@ class Qwen38DecodeDevice {
   virtual void Advance(const Qwen38CycleRecord& record, bool want_more) = 0;
   // Throws when the device accumulated an error over the cycles of the decode. Only called while no cycle is in flight.
   virtual void CheckDecodeStatus() {}
+  virtual int ReservedTail() const { return kReservedTail; }
 
   // Positions at the end of the KV store that are never filled: a verify step writes two rows past the committed length.
   static constexpr int kReservedTail = 4;
@@ -97,13 +102,23 @@ class Qwen38DecodeLedger {
   }
 
   void SetNumBanks(int num_banks) {
-    if (num_banks < 2 || num_banks > 5)
-      throw std::invalid_argument("qwen38_graph: recurrent bank count must be in [2, 5]");
+    if (num_banks < 2 || num_banks > 9)
+      throw std::invalid_argument("qwen38_graph: recurrent bank count must be in [2, 9]");
     if (length_ != 0)
       throw std::logic_error("qwen38_graph: cannot change recurrent bank count after prefill");
     num_banks_ = num_banks;
+    if (!compact_mode_) max_step_ = num_banks - 1;
+  }
+  void SetCompactMode(bool compact, int max_step = 8) {
+    if (length_ != 0)
+      throw std::logic_error("qwen38_graph: cannot change compact mode after prefill");
+    if (compact && (num_banks_ != 2 || max_step < 1 || max_step > 8))
+      throw std::invalid_argument("qwen38_graph: compact mode requires 2 banks and max_step in [1, 8]");
+    compact_mode_ = compact;
+    max_step_ = compact ? max_step : (num_banks_ - 1);
   }
   int NumBanks() const { return num_banks_; }
+  bool CompactMode() const { return compact_mode_; }
 
   void Reset() {
     bank_ = 0;
@@ -113,12 +128,12 @@ class Qwen38DecodeLedger {
   int Bank() const { return bank_; }
   size_t Length() const { return length_; }
 
-  // Commits `step` rows (1 .. num_banks_ - 1).
+  // Commits `step` rows (1 .. max_step_).
   void Advance(size_t step) {
-    const size_t max_step = static_cast<size_t>(num_banks_ - 1);
+    const size_t max_step = static_cast<size_t>(max_step_);
     if (step < 1 || step > max_step)
       throw std::logic_error("qwen38_graph: invalid committed row count " + std::to_string(step));
-    bank_ = static_cast<int>((static_cast<size_t>(bank_) + step) % static_cast<size_t>(num_banks_));
+    bank_ = compact_mode_ ? (bank_ ^ 1) : static_cast<int>((static_cast<size_t>(bank_) + step) % static_cast<size_t>(num_banks_));
     length_ += step;
   }
 
@@ -144,6 +159,8 @@ class Qwen38DecodeLedger {
  private:
   int capacity_;
   int num_banks_{kBanks};
+  int max_step_{kBanks - 1};
+  bool compact_mode_{false};
   int bank_{};
   size_t length_{};
 };

@@ -240,14 +240,20 @@ Qwen38GraphEngine::Qwen38GraphEngine(Qwen38GraphModel& model)
     throw std::runtime_error("qwen38_graph: suffix lookup requires folded MTP decode");
   if (fold_ && !mtp_enabled_) throw std::runtime_error("qwen38_graph: the fold stack requires model.qwen38_graph.mtp.enabled");
   for (const auto& name : model_.session_target_->GetOutputNames()) {
-    if (StartsWith(name, "present_mid3."))
+    if (StartsWith(name, "state_update.") && name.find(".conv_value") != std::string::npos) {
+      compact_state_updates_ = true;
+      const auto shape = model_.session_info_.GetOutputShape(name);
+      if (shape.size() >= 2 && shape[1] >= 1 && shape[1] + 1 <= kMaxVerifyRows) {
+        verify_rows_ = static_cast<int>(shape[1]) + 1;
+      }
+    } else if (StartsWith(name, "present_mid3."))
       verify_rows_ = 4;
     else if (StartsWith(name, "present_mid2."))
       verify_rows_ = std::max(verify_rows_, 3);
   }
   if (verify_rows_ > 2 && !fold_)
     throw std::runtime_error("qwen38_graph: multi-draft prefix states require folded MTP");
-  num_banks_ = fold_ ? verify_rows_ + 1 : kBanks;
+  num_banks_ = compact_state_updates_ ? 2 : (fold_ ? verify_rows_ + 1 : kBanks);
   stream_ = model_.p_device_->GetCudaStream();
   plane_.Check(plane_.set_device(0), "cudaSetDevice");
   memory_info_ = model_.p_device_->GetMemoryInfo();
@@ -281,7 +287,7 @@ Qwen38GraphEngine::Qwen38GraphEngine(Qwen38GraphModel& model)
   part_v_ = PlaneBuffer(plane_, kArgmaxBlocks * sizeof(float), stream_);
   part_i_ = PlaneBuffer(plane_, kArgmaxBlocks * sizeof(int32_t), stream_);
   buffered_logits_ = PlaneBuffer(plane_, static_cast<size_t>(verify_rows_ - 1) * vocab_ * sizeof(uint16_t), stream_);
-  const size_t slots = static_cast<size_t>(capacity_) + 3;
+  const size_t slots = static_cast<size_t>(capacity_) + static_cast<size_t>(kMaxVerifyRows);
   d_tokens_ = PlaneBuffer(plane_, slots * sizeof(int64_t), stream_);
   d_arange64_ = PlaneBuffer(plane_, slots * sizeof(int64_t), stream_);
   d_arange32_ = PlaneBuffer(plane_, slots * sizeof(int32_t), stream_);
@@ -326,6 +332,17 @@ Qwen38GraphEngine::Qwen38GraphEngine(Qwen38GraphModel& model)
     const auto start = Clock::now();
     std::vector<int32_t> dummy(verify_rows_ * num_banks_ * 8, 1000);
     StepPrefill(dummy);
+    {
+      auto& step = dflash_->step_;
+      const int64_t max_seq = static_cast<int64_t>(capacity_);
+      step.input_ids.Ensure(std::array<int64_t, 2>{1, static_cast<int64_t>(verify_rows_)});
+      step.positions.Ensure(std::array<int64_t, 2>{1, max_seq + 1});
+      step.context_hidden.Ensure(
+          std::array<int64_t, 3>{1, std::max<int64_t>(1, max_seq + 1 - verify_rows_), static_cast<int64_t>(kDflashWidth)});
+      step.current_seq_len.Ensure(std::array<int64_t, 1>{1});
+      step.past_seq_len.Ensure(std::array<int64_t, 2>{1, 1});
+      step.block_table.Ensure(std::array<int64_t, 2>{1, static_cast<int64_t>(dflash_->max_blocks_per_seq_)});
+    }
     Reset();
     warmup_seconds = SecondsSince(start);
   }
@@ -423,11 +440,13 @@ void Qwen38GraphEngine::BuildTarget() {
   }
   if (ple_layer_ < 0) throw std::runtime_error("qwen38_graph: target has no ple_embeddings input");
   if (fold_) {
-    for (const auto& name : bank_names) {
-      for (int prefix = 1; prefix < verify_rows_; ++prefix) {
-        const std::string tag = prefix == 1 ? "present_mid." : "present_mid" + std::to_string(prefix) + ".";
-        if (!info.HasOutput(tag + name.substr(16)))
-          throw std::runtime_error("qwen38_graph: missing prefix state " + tag + name.substr(16));
+    if (!compact_state_updates_) {
+      for (const auto& name : bank_names) {
+        for (int prefix = 1; prefix < verify_rows_; ++prefix) {
+          const std::string tag = prefix == 1 ? "present_mid." : "present_mid" + std::to_string(prefix) + ".";
+          if (!info.HasOutput(tag + name.substr(16)))
+            throw std::runtime_error("qwen38_graph: missing prefix state " + tag + name.substr(16));
+        }
       }
     }
     const auto ctl_shape = info.GetInputShape("fold.ctl");
@@ -482,6 +501,61 @@ void Qwen38GraphEngine::BuildTarget() {
                                       info.GetInputDataType(name));
   }
 
+  if (compact_state_updates_) {
+    const int32_t cap = verify_rows_ - 1;
+    capture_count_dev_ = PlaneBuffer(plane_, sizeof(int32_t), stream_);
+    plane_.Check(plane_.memcpy_h2d(capture_count_dev_.data(), &cap, sizeof(int32_t), stream_), "state_update_capture_count");
+    capture_count_tensor_ = MakeTensor(capture_count_dev_.data(), {1}, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32);
+    for (const auto& name : out_names) {
+      if (StartsWith(name, "state_update.")) {
+        NewDeviceTensor(state_updates_, name, FixedShape(info.GetOutputShape(name)), info.GetOutputDataType(name));
+      }
+    }
+    std::vector<Qwen38StateReplayDesc> descs;
+    for (const auto& name : bank_names) {
+      const std::string tail = name.substr(16);
+      const size_t dot = tail.find('.');
+      const std::string layer_str = tail.substr(0, dot);
+      const std::string suffix = tail.substr(dot + 1);
+      if (suffix == "index_lengths") continue;
+      Qwen38StateReplayDesc d{};
+      d.capture_cap = cap;
+      d.bank_ptrs[0] = banks_[0].tensors.at(name)->ptr;
+      d.bank_ptrs[1] = banks_[1].tensors.at(name)->ptr;
+      if (suffix == "recurrent") {
+        d.kind = 1;
+        d.state_update_ptr = state_updates_.at("state_update." + layer_str + ".recurrent_capsule")->ptr;
+      } else if (suffix == "conv") {
+        d.kind = 2;
+        const auto shape = FixedShape(info.GetInputShape(name));
+        d.channels = static_cast<int>(shape[1]);
+        d.state_length = static_cast<int>(shape[2]);
+        d.state_update_ptr = state_updates_.at("state_update." + layer_str + ".conv_value")->ptr;
+      } else if (suffix == "ple_context") {
+        d.kind = 3;
+        const auto shape = FixedShape(info.GetInputShape(name));
+        d.state_length = static_cast<int>(shape[1]);
+        d.channels = static_cast<int>(shape[2]);
+        d.state_update_ptr = state_updates_.at("state_update." + layer_str + ".ple_context")->ptr;
+      } else if (suffix == "index_buffer") {
+        d.kind = 4;
+        const std::string len_name = "past_key_values." + layer_str + ".index_lengths";
+        d.bank_len_ptrs[0] = banks_[0].tensors.at(len_name)->ptr;
+        d.bank_len_ptrs[1] = banks_[1].tensors.at(len_name)->ptr;
+        d.state_update_ptr = state_updates_.at("state_update." + layer_str + ".indexer_value")->ptr;
+        d.state_capacity = 0;
+      } else {
+        throw std::runtime_error("qwen38_graph: unknown bank state suffix for compact replay: " + name);
+      }
+      descs.push_back(d);
+    }
+    num_replay_descs_ = static_cast<int>(descs.size());
+    replay_descs_dev_ = PlaneBuffer(plane_, descs.size() * sizeof(Qwen38StateReplayDesc), stream_);
+    plane_.Check(plane_.memcpy_h2d(replay_descs_dev_.data(), descs.data(), descs.size() * sizeof(Qwen38StateReplayDesc), stream_),
+                 "replay_descs");
+    SyncStream();
+  }
+
   if (fold_) {
     // fold.* control inputs alias the device control block; fold.ptrs = (pinned result ring address, ring size)
     fold_ptrs_ = PlaneBuffer(plane_, 2 * sizeof(int64_t), stream_);
@@ -533,13 +607,17 @@ void Qwen38GraphEngine::BuildTarget() {
       Direction& d = dirs_[rows - 1][k];
       d.binding = OrtIoBinding::Create(session);
       Bank& in_bank = banks_[k];
-      Bank& out_bank = banks_[(k + rows) % num_banks_];
-      Bank& mid_bank = rows > 1 ? banks_[(k + 1) % num_banks_] : banks_[num_banks_];
+      Bank& out_bank = compact_state_updates_ ? banks_[k ^ 1] : banks_[(k + rows) % num_banks_];
+      Bank& mid_bank = compact_state_updates_ ? banks_[k ^ 1] : (rows > 1 ? banks_[(k + 1) % num_banks_] : banks_[num_banks_]);
       std::map<std::string, std::unique_ptr<DevTensor>> own;
       auto add_own = [&](const std::string& name, std::vector<int64_t> shape, ONNXTensorElementDataType type) {
         return NewDeviceTensor(own, name, std::move(shape), type);
       };
       for (const auto& name : in_names) {
+        if (name == "state_update_capture_count") {
+          d.binding->BindInput(name.c_str(), *capture_count_tensor_->value);
+          continue;
+        }
         if (name == "prefill_numerics") {
           d.binding->BindInput(name.c_str(), PrefillNumerics(false));
           continue;
@@ -625,6 +703,8 @@ void Qwen38GraphEngine::BuildTarget() {
           t = state_for(name.substr(12), mid_bank);
         else if (StartsWith(name, "present."))
           t = state_for(name.substr(8), out_bank);
+        else if (StartsWith(name, "state_update."))
+          t = state_updates_.at(name).get();
         else if (name == "logits")
           t = add_own(name, {1, rows, vocab_}, dtype_logits);
         else if (name == hidden_name)
@@ -833,6 +913,11 @@ void Qwen38GraphEngine::PrepRow(int rows, int row, const void* tok, const void* 
               in.ple + 2 * static_cast<size_t>(ple_width_) * row, ctl_.data());
 }
 
+void Qwen38GraphEngine::ReplayStateUpdates(int src_bank, int dst_bank, int step) {
+  if (!compact_state_updates_ || num_replay_descs_ <= 0 || !plane_.replay_state_updates) return;
+  plane_.replay_state_updates(stream_, replay_descs_dev_.data(), num_replay_descs_, src_bank, dst_bank, step);
+}
+
 void Qwen38GraphEngine::RunTarget(int rows, int phase) {
   Direction& d = dirs_[rows - 1][phase % num_banks_];
   model_.session_target_->Run(d.run_options.get(), *d.binding);
@@ -929,7 +1014,15 @@ void Qwen38GraphEngine::StepPrefill(std::span<const int32_t> tokens) {
     if (keep_hidden_)
       plane_.Check(plane_.memcpy_d2d(d_prompt_hidden_.data() + gi * row_bytes, d.hidden, step * row_bytes, stream_),
                    "keep hidden");
-    cur_ = static_cast<int>((cur_ + step) % num_banks_);
+    if (compact_state_updates_) {
+      const int next_bank = cur_ ^ 1;
+      if (step < static_cast<size_t>(rows)) {
+        ReplayStateUpdates(cur_, next_bank, static_cast<int>(step));
+      }
+      cur_ = next_bank;
+    } else {
+      cur_ = static_cast<int>((cur_ + step) % num_banks_);
+    }
     i += step;
     last = &d;
     last_row = static_cast<int>(step) - 1;
@@ -1199,7 +1292,7 @@ void Qwen38GraphEngine::EnqueueFold() {
   if (force_reject_) ForceRejectDraft();
   if (length_ + verify_rows_ > static_cast<size_t>(capacity_)) throw std::runtime_error("qwen38_graph: KV capacity reached");
   const uint8_t* ctl = ctl_.data();
-  constexpr int slots[kMaxVerifyRows] = {0, 2, 8, 9};
+  constexpr int slots[kMaxVerifyRows] = {0, 2, 8, 9, 10, 11, 12, 13};
   for (int row = 0; row < verify_rows_; ++row) {
     const void* ctx_in = row == 0 ? ctx_commit_.data() : ctx_a_.data() + 16 * (row - 1);
     PrepRow(verify_rows_, row, ctl + 8 * slots[row], ctl + 8, row, ctx_in, ctx_a_.data() + 16 * row);
@@ -1311,20 +1404,33 @@ Qwen38CycleResult Qwen38GraphEngine::WaitCycle() {
   }
   std::atomic_thread_fence(std::memory_order_acquire);
   Qwen38CycleResult result;
-  result.pred0 = record[1];
-  result.pred1 = record[2];
+  auto unpack_lo = [](int64_t w) -> int64_t {
+    return static_cast<int64_t>(static_cast<int32_t>(static_cast<uint64_t>(w) & 0xffffffffu));
+  };
+  auto unpack_hi = [](int64_t w) -> int64_t {
+    return static_cast<int64_t>(static_cast<int32_t>(static_cast<uint64_t>(w) >> 32));
+  };
+  result.pred0 = verify_rows_ > 4 ? unpack_lo(record[1]) : record[1];
+  result.pred1 = verify_rows_ > 5 ? unpack_lo(record[2]) : record[2];
   result.proposed_count = mtp_enabled_ ? verify_rows_ - 1 : 1;
-  if (record[3] < 0 || record[3] > result.proposed_count)
+  const int64_t raw_accepted = verify_rows_ > 6 ? unpack_lo(record[3]) : record[3];
+  if (raw_accepted < 0 || raw_accepted > result.proposed_count)
     throw std::runtime_error("qwen38_graph: invalid device accepted-prefix count");
-  result.accepted_count = mtp_enabled_ ? static_cast<int>(record[3]) : 0;
+  result.accepted_count = mtp_enabled_ ? static_cast<int>(raw_accepted) : 0;
   result.accepted = result.accepted_count > 0;
   result.status = record[4];
-  result.new_pending = record[5];
+  result.new_pending = verify_rows_ > 7 ? unpack_lo(record[5]) : record[5];
   result.new_length = record[6];
   if (verify_rows_ > 2) {
     const uint64_t packed = static_cast<uint64_t>(record[7]);
     result.pred2 = static_cast<int64_t>(static_cast<int32_t>(packed & 0xffffffffu));
     result.pred3 = static_cast<int64_t>(static_cast<int32_t>(packed >> 32));
+  }
+  if (verify_rows_ > 4) {
+    result.pred4 = unpack_hi(record[1]);
+    result.pred5 = verify_rows_ > 5 ? unpack_hi(record[2]) : 0;
+    result.pred6 = verify_rows_ > 6 ? unpack_hi(record[3]) : 0;
+    result.pred7 = verify_rows_ > 7 ? unpack_hi(record[5]) : 0;
   }
   result.suffix_lookup_attempted = suffix_lookup_attempted_;
   result.suffix_lookup_hit = suffix_lookup_hit_;
@@ -1340,7 +1446,15 @@ Qwen38CycleResult Qwen38GraphEngine::WaitCycle() {
 
 void Qwen38GraphEngine::Advance(const Qwen38CycleResult& result, bool want_more) {
   const size_t step = mtp_enabled_ ? static_cast<size_t>(result.TokenCount()) : 1;
-  cur_ = static_cast<int>((cur_ + step) % num_banks_);
+  if (compact_state_updates_) {
+    const int next_bank = cur_ ^ 1;
+    if (step < static_cast<size_t>(verify_rows_)) {
+      ReplayStateUpdates(cur_, next_bank, static_cast<int>(step));
+    }
+    cur_ = next_bank;
+  } else {
+    cur_ = static_cast<int>((cur_ + step) % num_banks_);
+  }
   length_ += step;
   if (fold_) head_length_ += static_cast<int>(step);
   if (static_cast<int64_t>(length_) != result.new_length)
@@ -1356,7 +1470,9 @@ void Qwen38GraphEngine::Advance(const Qwen38CycleResult& result, bool want_more)
   suffix_lookup_tokens_proposed_ = 0;
   if (suffix_lookup_mode_ != 0) {
     suffix_drafter_.AppendToken(pending_);
-    const int64_t predictions[kMaxVerifyRows] = {result.pred0, result.pred1, result.pred2, result.pred3};
+    const int64_t predictions[kMaxVerifyRows] = {
+        result.pred0, result.pred1, result.pred2, result.pred3,
+        result.pred4, result.pred5, result.pred6, result.pred7};
     for (int i = 0; i < result.AcceptedCount(); ++i)
       suffix_drafter_.AppendToken(static_cast<int32_t>(predictions[i]));
   }
@@ -1370,10 +1486,10 @@ void Qwen38GraphEngine::Advance(const Qwen38CycleResult& result, bool want_more)
   if (fold_) {
     if (suffix_lookup_mode_ == 1 || (suffix_lookup_mode_ == 2 && !result.accepted)) {
       suffix_lookup_attempted_ = true;
-      std::array<int32_t, 3> drafts{};
+      std::array<int32_t, 7> drafts{};
       const size_t count = suffix_drafter_.ProposeDrafts(pending_, std::span<int32_t>(drafts).first(verify_rows_ - 1));
       suffix_lookup_tokens_proposed_ = count;
-      constexpr int slots[3] = {2, 8, 9};
+      constexpr int slots[7] = {2, 8, 9, 10, 11, 12, 13};
       for (size_t i = 0; i < count; ++i) {
         const int64_t draft = drafts[i];
         WriteCtl(slots[i], {&draft, 1});
@@ -1435,7 +1551,7 @@ void Qwen38GraphEngine::Draft(const uint8_t* features, size_t rows, size_t posit
     }
     if (drafts.size() != 1 || drafts[0].size() != size_t(verify_rows_ - 1))
       throw std::runtime_error("DFlash experiment returned an incomplete proposal");
-    constexpr int slots[3] = {2, 8, 9};
+    constexpr int slots[7] = {2, 8, 9, 10, 11, 12, 13};
     for (size_t i = 0; i < drafts[0].size(); ++i) {
       stage_host_[4 + i] = drafts[0][i];
       plane_.Check(plane_.memcpy_h2d(ctl_.data() + 8 * slots[i], stage_host_ + 4 + i,
