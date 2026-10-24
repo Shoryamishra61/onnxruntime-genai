@@ -1291,12 +1291,9 @@ void Qwen38GraphEngine::ForceRejectDraft() {
 void Qwen38GraphEngine::EnqueueFold() {
   if (force_reject_) ForceRejectDraft();
   if (length_ + verify_rows_ > static_cast<size_t>(capacity_)) throw std::runtime_error("qwen38_graph: KV capacity reached");
-  const uint8_t* ctl = ctl_.data();
-  constexpr int slots[kMaxVerifyRows] = {0, 2, 8, 9, 10, 11, 12, 13};
-  for (int row = 0; row < verify_rows_; ++row) {
-    const void* ctx_in = row == 0 ? ctx_commit_.data() : ctx_a_.data() + 16 * (row - 1);
-    PrepRow(verify_rows_, row, ctl + 8 * slots[row], ctl + 8, row, ctx_in, ctx_a_.data() + 16 * row);
-  }
+  const RowInputs& in = inputs_[verify_rows_ - 1];
+  plane_.prep(stream_, params_dev_.data(), ctl_.data(), ctl_.data() + 8, -verify_rows_, ctx_commit_.data(),
+              ctx_a_.data(), in.input_ids, in.position_ids, in.committed, past_pos_, in.ple, ctl_.data());
   RunTarget(verify_rows_, cur_);
   Direction& d = dirs_[verify_rows_ - 1][cur_ % num_banks_];
   last_hidden_ptr_ = d.hidden;
