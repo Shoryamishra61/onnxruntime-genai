@@ -33,7 +33,6 @@ struct Qwen38Plane : Qwen38PlaneFunctions {
   Qwen38Plane& operator=(const Qwen38Plane&) = delete;
 
   void Check(int error, const char* what) const;
-
 };
 
 // Device allocation owned by RAII.
@@ -399,6 +398,7 @@ struct Qwen38GraphEngine {
   PlaneBuffer d_dflash_prompt_;
   size_t dflash_prompt_rows_{};
   size_t dflash_prompt_position_{};
+  bool dflash_ingested_in_turn_{false};
   static constexpr size_t kDflashWidth = 12800;
   std::vector<float> last_logits_host_;
 

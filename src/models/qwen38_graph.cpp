@@ -328,8 +328,24 @@ Qwen38GraphEngine::Qwen38GraphEngine(Qwen38GraphModel& model)
     d_dflash_prompt_ = PlaneBuffer(plane_, size_t(fast_->chunk) * kDflashWidth * 2, stream_);
   }
   Reset();
+  struct DflashWarmupEnvGuard {
+#if defined(_WIN32)
+    DflashWarmupEnvGuard() { _putenv_s("ORT_QMOE_IN_WARMUP", "1"); }
+    ~DflashWarmupEnvGuard() {
+      _putenv_s("ORT_QMOE_IN_WARMUP", "0");
+      _putenv_s("ORT_QMOE_PREFILL_NEW_TURN", "0");
+    }
+#else
+    DflashWarmupEnvGuard() { setenv("ORT_QMOE_IN_WARMUP", "1", 1); }
+    ~DflashWarmupEnvGuard() {
+      setenv("ORT_QMOE_IN_WARMUP", "0", 1);
+      setenv("ORT_QMOE_PREFILL_NEW_TURN", "0", 1);
+    }
+#endif
+  };
   if (dflash_) {
     const auto start = Clock::now();
+    DflashWarmupEnvGuard warmup_guard;
     std::vector<int32_t> dummy(verify_rows_ * num_banks_ * 8, 1000);
     StepPrefill(dummy);
     {
@@ -348,6 +364,7 @@ Qwen38GraphEngine::Qwen38GraphEngine(Qwen38GraphModel& model)
   }
   if (q.warmup) {
     const auto start = Clock::now();
+    DflashWarmupEnvGuard warmup_guard;
     Warmup();
     warmup_seconds = SecondsSince(start);
   }
@@ -876,6 +893,7 @@ void Qwen38GraphEngine::Reset() {
   SyncStream();
   if (dflash_) dflash_->ReleaseAll();
   dflash_prompt_rows_ = 0;
+  dflash_ingested_in_turn_ = false;
   for (auto& bank : banks_) {
     if (bank.arena.data())
       plane_.Check(plane_.memset_(bank.arena.data(), 0, bank.arena.size(), stream_), "clear bank");
