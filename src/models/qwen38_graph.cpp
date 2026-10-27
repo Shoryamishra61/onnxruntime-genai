@@ -2299,7 +2299,7 @@ Qwen38GraphModel::Qwen38GraphModel(std::unique_ptr<Config> config, OrtEnv& ort_e
     const char* adaptive_env = std::getenv("ORT_QWEN38_ADAPTIVE_CTX_BUDGET");
     const bool adaptive_ctx = (adaptive_env != nullptr && std::string(adaptive_env) == "1");
     const int64_t diff_tokens = static_cast<int64_t>(config_->model.qwen38_graph.kv_capacity) - 33032LL;
-    const int64_t delta_kv_bytes = diff_tokens * (diff_tokens > 0 ? 38912LL : 16384LL);
+    const int64_t delta_kv_bytes = diff_tokens * 16384LL;
     if (adaptive_ctx && delta_kv_bytes != 0) {
       if (has_explicit_expert_bytes && delta_kv_bytes > 0) {
         const int64_t adj_expert = std::max<int64_t>(
