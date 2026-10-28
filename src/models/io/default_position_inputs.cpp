@@ -102,6 +102,8 @@ void DefaultPositionInputs::RewindTo(size_t index) {
   // Reset the state of the position inputs
   if (index == 0) {
     is_first_update_ = true;
+    position_ids_shape_[0] = state_.params_->search.batch_size;
+    attention_mask_shape_[0] = state_.params_->search.batch_size;
     // Position ids next is set to nullptr after the first Run() call. This restores it
     if (has_posid_input_)
       position_ids_next_ = std::make_unique<Tensor>(model_.p_device_inputs_, type_);
